@@ -1,4 +1,5 @@
 import pprint
+import time
 import requests
 from DIRAC import S_OK, S_ERROR, gConfig
 from DIRAC.Core.Base.AgentModule import AgentModule
@@ -53,10 +54,8 @@ DEFAULT_CI = 24
 DEFAULT_PUE = 1.5
 DEFAULT_TDP = 150
 
-# Getting tokens at
 
-METRICS_DB_URL = "https://mc-a4.lab.uvalight.net/gd-cim-api/submit"
-METRICS_DB_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhdHNhcmVnQGluMnAzLmZyIiwiaXNzIjoiZ3JlZW5kaWdpdC1sb2dpbi11dmEiLCJpYXQiOjE3NTkzMDA5ODYsIm5iZiI6MTc1OTMwMDk4NiwiZXhwIjoxNzU5Mzg3Mzg2fQ.A4nygJEdhvOQjkLe-ckRDidqVbi6-s4kZXLRUZkwek8"
+
 
 
 class GreenReportingAgent(AgentModule):
@@ -73,6 +72,14 @@ class GreenReportingAgent(AgentModule):
 
         self.maxJobsAtOnce = 50
         self.section = PathFinder.getAgentSection(self.agentName)
+        self.login = "atsareg@in2p3.fr"
+        self.password = "Green@31415"
+        # how long in hours shall we wait before refreshing the token
+        self.token_max_age_hours = 24
+        self.metrics_db_url = "https://mc-a4.lab.uvalight.net/gd-cim-api/submit"
+        self.cim_api_base = "https://mc-a4.lab.uvalight.net/gd-cim-api"
+        self.token = None
+        self.token_ts = None
 
     #############################################################################
     def initialize(self):
@@ -93,6 +100,13 @@ class GreenReportingAgent(AgentModule):
                 return S_ERROR(f"Can't connect to ES DB: {excp}")
 
         self.maxJobsAtOnce = self.am_getOption("MaxJobsAtOnce", self.maxJobsAtOnce)
+
+        self.login = self.am_getOption("CIM_EMAIL", self.login)
+        self.password = self.am_getOption("CIM_PASSWORD", self.password)
+        # simulate other parameters can be read from dirac conf, otherwise fallback to what is init in the code
+        self.token_max_age_hours = self.am_getOption("token_max_age_hours", self.token_max_age_hours)
+        self.metrics_db_url = self.am_getOption("metrics_db_url", self.metrics_db_url)
+        self.cim_api_base = self.am_getOption("cim_api_base", self.cim_api_base)
 
         self.cpuDict = {}
         result = gConfig.getSections(f"{self.section}/CPUData")
@@ -134,12 +148,6 @@ class GreenReportingAgent(AgentModule):
             self.log.info("No attributes found")
             return S_ERROR("No attributes found")
         jobAttrDict = result["Value"]
-
-
-        #pprint.pprint(jo)
-        #pprint.pprint(jobAttrDict)
-        print("hello world")
-        # Form records
         records = []
         for job in jobParamsDict:
             jobDict = {}
@@ -170,6 +178,7 @@ class GreenReportingAgent(AgentModule):
                 self.log.error("Failed to get processor parameters")
                 continue
             tdp, n_cores = result["Value"]
+            ### unused var remove
             site = record.get("Site", "Unknown")
             result = self.__getSiteParameters(record["Site"])
             if not result["OK"]:
@@ -192,13 +201,31 @@ class GreenReportingAgent(AgentModule):
 
         return S_OK()
 
+    def __get_jwt_token(self):
+        if self.token and self.token_ts:
+            try:
+                ts = float(self.token_ts)
+                age_hours = (time.time() - ts) / 3600
+                # token still fresh
+                if age_hours < self.token_max_age_hours:
+                    return self.token
+            except ValueError:
+                pass  # Timestamp corrupted or missing → refresh
+        ## refreshing the token (handles first run as well)
+        url = f"{self.cim_api_base.rstrip('/')}/get-token"
+        r = requests.post(url, json={"email": self.login, "password": self.password}, timeout=10)
+        r.raise_for_status()
+        self.token = r.json()["access_token"]
+        self.token_ts = str(time.time())
+        return self.token
+
     def __sendRecordToMB(self, record):
 
-        headers = { "Authorization": f"Bearer {METRICS_DB_TOKEN}",
+        metrics_db_token = self.__get_jwt_token()
+        headers = { "Authorization": f"Bearer {metrics_db_token}",
                     "Content-Type": "application/json"
                   }
-
-        response = requests.post(METRICS_DB_URL,
+        response = requests.post(self.metrics_db_url,
                                  headers = headers,
                                  json = record
                                 )
@@ -209,7 +236,8 @@ class GreenReportingAgent(AgentModule):
 
     def __getSiteParameters(self, site):
         """ To be implemented """
-
+        ##### we shall get them from the CIM AP, no?
+        ##### what shall we do with them thereafter?
         grid = site.split(".")[0]
         gocdb_name = gConfig.getValue(f"/Resources/Sites/{grid}/{site}/Name", site)
         pue = gConfig.getValue(f"/Resources/Sites/{grid}/{site}/GreenParams/PUE", DEFAULT_PUE)
