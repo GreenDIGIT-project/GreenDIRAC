@@ -158,13 +158,13 @@ class SiteDirector(BaseSiteDirector):
             try:
                 pue, ci, _gocdb = self.cimClient.getSiteGreenMetrics(site)
             except Exception:
-                pue, ci = 3.0, 1000.0
+                pue, ci = 1.7, 500.0
             siteMetrics[site] = (pue, ci)
 
         for qName, qDict in self.queueDict.items():
             site = qDict.get("Site", "")
             ce = qDict.get("CEName", "")
-            pue, ci = siteMetrics.get(site, (3.0, 1000.0))
+            pue, ci = siteMetrics.get(site, (1.7, 500.0))
 
             # CEE
             cee = avgCEE.get(ce, DEFAULT_CEE)
@@ -267,6 +267,40 @@ class SiteDirector(BaseSiteDirector):
             self.log.error(f"GreenSiteDirector: ES aggregation failed: {res['Message']}")
             return self._ceeCache
 
+        # Expected Elasticsearch response layout (subset used by SiteDirector):
+        # {
+        #   "took": <int_ms>,
+        #   "timed_out": <bool>,
+        #   "_shards": {
+        #     "total": <int>,
+        #     "successful": <int>,
+        #     "skipped": <int>,
+        #     "failed": <int>
+        #   },
+        #   "hits": {
+        #     "total": {
+        #       "value": <int_total_docs_matching_query>,
+        #       "relation": "eq" | "gte"
+        #     },
+        #     "max_score": null,
+        #     "hits": []   # empty because query uses "size": 0
+        #   },
+        #   "aggregations": {
+        #     "by_gridce": {
+        #       "doc_count_error_upper_bound": <int>,
+        #       "sum_other_doc_count": <int>,
+        #       "buckets": [
+        #         {
+        #           "key": "<GridCE>",
+        #           "doc_count": <int_docs_for_this_gridce>,
+        #           "avg_cee": {
+        #             "value": <float_or_null>
+        #           }
+        #         }
+        #       ]
+        #     }
+        #   }
+        # }
         totalHits = (
             res["Value"]
             .get("hits", {})

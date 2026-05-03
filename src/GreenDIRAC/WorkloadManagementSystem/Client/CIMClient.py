@@ -12,8 +12,8 @@ import requests
 from DIRAC.ConfigurationSystem.Client.Utilities import getDIRACGOCDictionary
 
 
-DEFAULT_PUE = 3
-DEFAULT_CI = 1000
+DEFAULT_PUE = 1.7
+DEFAULT_CI = 500
 DEFAULT_ENERGY_WH = 8500
 
 DEFAULT_TOKEN_MAX_AGE_H = 24
@@ -187,6 +187,71 @@ class CIMClient:
             ]
             for key, _value in oldest:
                 del self._site_cache[key]
+
+    # def _prune_cache(self, now):
+    #     """
+    #     Site-aware prune policy:
+    #     - Keep at least ONE cached entry per site (fresh or stale).
+    #     - Remove stale/overflow entries only when a site has >1 entries.
+    #     - If every remaining entry is the last one for its site, allow temporary overflow
+    #       instead of evicting the final fallback.
+    #     """
+    #     if not self._site_cache:
+    #         return
+    #
+    #     def _site_counts():
+    #         counts = {}
+    #         for (site, _bucket) in self._site_cache:
+    #             counts[site] = counts.get(site, 0) + 1
+    #         return counts
+    #
+    #     # -----------------------------
+    #     # 1) Age-based prune (safe)
+    #     # -----------------------------
+    #     if self.stale_max_age_s > 0:
+    #         site_counts = _site_counts()
+    #         old_entries = sorted(
+    #             self._site_cache.items(), key=lambda item: item[1][0]
+    #         )  # oldest first
+    #
+    #         for key, (ts, _pue, _ci, _gocdb) in old_entries:
+    #             age = now - ts
+    #             if age <= self.stale_max_age_s:
+    #                 continue
+    #
+    #             site = key[0]
+    #             # delete only if site keeps at least one entry after deletion
+    #             if site_counts.get(site, 0) > 1:
+    #                 del self._site_cache[key]
+    #                 site_counts[site] -= 1
+    #
+    #     # -----------------------------
+    #     # 2) Size-based prune (safe)
+    #     # -----------------------------
+    #     if self.cache_max_entries > 0 and len(self._site_cache) > self.cache_max_entries:
+    #         site_counts = _site_counts()
+    #         candidates = sorted(
+    #             self._site_cache.items(), key=lambda item: item[1][0]
+    #         )  # oldest first
+    #
+    #         # Evict oldest entries, but never the last one for a site
+    #         for key, (_ts, _pue, _ci, _gocdb) in candidates:
+    #             if len(self._site_cache) <= self.cache_max_entries:
+    #                 break
+    #
+    #             site = key[0]
+    #             if site_counts.get(site, 0) > 1:
+    #                 del self._site_cache[key]
+    #                 site_counts[site] -= 1
+    #
+    #         # Optional: if still over limit, keep overflow rather than dropping
+    #         # the last fallback for any site.
+    #         if len(self._site_cache) > self.cache_max_entries:
+    #             self._log(
+    #                 "warn",
+    #                 f"Cache above max_entries={self.cache_max_entries}, "
+    #                 "kept overflow to preserve one fallback per site",
+    #             )
 
     def _get_stale_fallback(self, site, cache_key, now):
         exact = self._site_cache.get(cache_key)

@@ -312,6 +312,7 @@ class GreenReportingAgent(AgentModule):
             startCIM = time.time()
 
             try:
+                self.log.info(f"Submitting full record to CIM: {rec}")
                 ok = self.cimClient.submitRecord(rec)
                 if ok:
                     self.log.info(

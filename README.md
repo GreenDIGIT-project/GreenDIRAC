@@ -23,8 +23,6 @@ for the environmental cost of running jobs.
 `CIMClient` reads credentials and API endpoints from:
 `src/GreenDIRAC/WorkloadManagementSystem/Client/cim.conf`
 
-This file is local-only and must not be committed. It is ignored by git.
-
 Required sections and keys:
 - `[CIM]`: `EMAIL`, `PASSWORD`, `API_BASE`, `METRICS_URL`
 - `[KPI]`: `API_BASE`
