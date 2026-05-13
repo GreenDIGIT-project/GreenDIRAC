@@ -1,0 +1,7 @@
+src/GreenDIRAC/WorkloadManagementSystem/Client/cim.conf
+src/GreenDIRAC/WorkloadManagementSystem/Agent/CIM2CSAgent.py
+
+.idea/
+__pycache__/
+*.egg-info/
+token

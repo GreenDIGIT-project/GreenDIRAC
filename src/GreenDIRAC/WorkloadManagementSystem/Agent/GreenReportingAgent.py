@@ -1,5 +1,13 @@
-import pprint
-import requests
+#!/usr/bin/env python3
+"""
+GreenReportingAgent — Queries CIMClient for site green metrics,
+submits per-job green metrics to CIM,
+and stores them in DIRAC JobDB / ElasticSearch.
+"""
+
+from datetime import timezone
+import time
+
 from DIRAC import S_OK, S_ERROR, gConfig
 from DIRAC.Core.Base.AgentModule import AgentModule
 from DIRAC.WorkloadManagementSystem.Client import JobStatus
@@ -9,218 +17,393 @@ from DIRAC.Core.Utilities.ObjectLoader import ObjectLoader
 from DIRAC.ConfigurationSystem.Client.Helpers import Registry
 from DIRAC.ConfigurationSystem.Client import PathFinder
 
+from GreenDIRAC.WorkloadManagementSystem.Client.CIMClient import CIMClient
 
-JOB_PARAMETER_KEYS = ["ModelName",
-            "CPUNormalizationFactor",
-            "HostName",
-            "JobID",
-            "JobType",
-            "LoadAverage",
-            "MemoryUsed(kb)",
-            "NormCPUTime(s)",
-            "ScaledCPUTime(s)",
-            "Status",
-            "TotalCPUTime(s)",
-            "WallClockTime(s)",
-            "DiskSpace(MB)",
-            "CEQueue",
-            "GridCE",
-       ]
-
-JOB_ATTRIBUTE_KEYS = [
-                       "JobGroup",
-                       "JobName",
-                       "Owner",
-                       "OwnerDN",
-                       "OwnerGroup",
-                       "RescheduleCounter",
-                       "Site",
-                       "SubmissionTime",
-                       "StartExecTime",
-                       "EndExecTime",
-                       "SystemPriority",
-                       "UserPriority",
-                     ]
-
-TIME_STAMPS = [
-                "SubmissionTime",
-                "StartExecTime",
-                "EndExecTime",
+# --------------------------------------------------------
+# DIRAC job parameters and attributes
+# --------------------------------------------------------
+JOB_PARAMETER_KEYS = [
+    "ModelName", "CPUNormalizationFactor", "HostName", "JobID", "JobType",
+    "LoadAverage", "MemoryUsed(kb)", "NormCPUTime(s)", "ScaledCPUTime(s)",
+    "Status", "TotalCPUTime(s)", "WallClockTime(s)", "DiskSpace(MB)",
+    "CEQueue", "GridCE",
 ]
 
-# Some tentative values
-DEFAULT_CI = 24
-DEFAULT_PUE = 1.5
+JOB_ATTRIBUTE_KEYS = [
+    "JobGroup", "JobName", "Owner", "OwnerDN", "OwnerGroup",
+    "RescheduleCounter", "Site",
+    "SubmissionTime", "StartExecTime", "EndExecTime",
+    "SystemPriority", "UserPriority",
+]
+
+SITES_EUROPE = [
+    "Cloud.IHPC.fr",
+    "EGI.ARNES.si",
+    "EGI.AUVERGRID.fr",
+    "EGI.BARI.it",
+    "EGI.CATANIA.it",
+    "EGI.CERN.ch",
+    "EGI.CESNET.cz",
+    "EGI.CIEMAT.es",
+    "EGI.CIRMMP.it",
+    "EGI.CNAF.it",
+    "EGI.CNR.it",
+    "EGI.CPPM.fr",
+    "EGI.CREATIS.fr",
+    "EGI.CYFRONET.pl",
+    "EGI.DESY.de",
+    "EGI.DESYZN.de",
+    "EGI.FRASCATI.it",
+    "EGI.GOEGRID.de",
+    "EGI.GRIDKA.de",
+    "EGI.GRIF.fr",
+    "EGI.HEPACC.uk",
+    "EGI.IFAE.es",
+    "EGI.IFCA.es",
+    "EGI.IN2P3-CC.fr",
+    "EGI.INFN-COSENZA.it",
+    "EGI.INFN-GENOVA.it",
+    "EGI.INFN-LECCE.it",
+    "EGI.INFN-NAPOLI.it",
+    "EGI.INFN-PISA.it",
+    "EGI.INGRID.pt",
+    "EGI.IRB.hr",
+    "EGI.IRES.fr",
+    "EGI.JINR.ru",
+    "EGI.KFKI.hu",
+    "EGI.LAPP.fr",
+    "EGI.LNL.it",
+    "EGI.LPC.fr",
+    "EGI.LSGRUG.nl",
+    "EGI.METU.tr",
+    "EGI.NCBJ.pl",
+    "EGI.NIKHEF.nl",
+    "EGI.ROMA3.it",
+    "EGI.RWTH-Aachen.de",
+    "EGI.SARA.nl",
+    "EGI.SRCE.hr",
+    "EGI.SiGNET.si",
+    "EGI.TASK.pl",
+    "EGI.TORINO.it",
+    "EGI.TRIESTE.it",
+    "EGI.UCL.be",
+    "EGI.UKI.uk",
+    "EGI.UKIAC.uk",
+    "EGI.UKIB.uk",
+    "EGI.UKID.uk",
+    "EGI.UKIG.uk",
+    "EGI.UKIL.uk",
+    "EGI.UKILH.uk",
+    "EGI.UKIM.uk",
+    "EGI.UKIMBH.uk",
+    "EGI.UKIR.uk",
+    "EGI.UKIRALPP.uk",
+    "EGI.UKISHEF.uk",
+    "EGI.ULAKBIM.tr",
+    "EGI.ULB.be",
+    "EGI.UNI-SIEGEN-HEP.de",
+]
+
+TIME_STAMPS = ["SubmissionTime", "StartExecTime", "EndExecTime"]
+
 DEFAULT_TDP = 150
 
-# Getting tokens at
-
-METRICS_DB_URL = "https://mc-a4.lab.uvalight.net/gd-cim-api/submit"
-METRICS_DB_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhdHNhcmVnQGluMnAzLmZyIiwiaXNzIjoiZ3JlZW5kaWdpdC1sb2dpbi11dmEiLCJpYXQiOjE3NTkzMDA5ODYsIm5iZiI6MTc1OTMwMDk4NiwiZXhwIjoxNzU5Mzg3Mzg2fQ.A4nygJEdhvOQjkLe-ckRDidqVbi6-s4kZXLRUZkwek8"
+IDLE_CONSUMPTION_FACTOR = 0.4
 
 
+# ==========================================================
+#               GreenReportingAgent
+# ==========================================================
 class GreenReportingAgent(AgentModule):
-    """
-    Agent for removing jobs in status "Deleted", and not only
-    """
 
     def __init__(self, *args, **kwargs):
-        """c'tor"""
         super().__init__(*args, **kwargs)
 
-        # clients
         self.jobDB = None
+        self.elasticJobParametersDB = None
+        self.maxJobsAtOnce = 1000
 
-        self.maxJobsAtOnce = 50
         self.section = PathFinder.getAgentSection(self.agentName)
 
-    #############################################################################
+        # CIM abstraction
+        self.cimClient = None
+
+    # -----------------------------------------------------
     def initialize(self):
-        """Sets defaults"""
 
         self.jobDB = JobDB()
+
+        # ElasticSearch support
         self.elasticJobParametersDB = None
-        useESForJobParametersFlag = Operations().getValue("/Services/JobMonitoring/useESForJobParametersFlag", False)
-        if useESForJobParametersFlag:
-            try:
-                result = ObjectLoader().loadObject(
-                    "WorkloadManagementSystem.DB.ElasticJobParametersDB", "ElasticJobParametersDB"
-                )
-                if not result["OK"]:
-                    return result
-                self.elasticJobParametersDB = result["Value"](parentLogger=self.log)
-            except RuntimeError as excp:
-                return S_ERROR(f"Can't connect to ES DB: {excp}")
+        useES = Operations().getValue(
+            "/Services/JobMonitoring/useESForJobParametersFlag", False
+        )
 
-        self.maxJobsAtOnce = self.am_getOption("MaxJobsAtOnce", self.maxJobsAtOnce)
+        if useES:
+            res = ObjectLoader().loadObject(
+                "WorkloadManagementSystem.DB.ElasticJobParametersDB",
+                "ElasticJobParametersDB",
+            )
+            if res["OK"]:
+                self.elasticJobParametersDB = res["Value"](parentLogger=self.log)
+                self.log.info("Using ElasticJobParametersDB")
+            else:
+                self.log.warn("Falling back to JobDB for job parameters")
 
+        self.maxJobsAtOnce = self.am_getOption(
+            "MaxJobsAtOnce", self.maxJobsAtOnce
+        )
+
+        # Instantiate CIM client
+        self.cimClient = CIMClient(logger=self.log)
+
+        # Load CPU models
         self.cpuDict = {}
-        result = gConfig.getSections(f"{self.section}/CPUData")
-        if result["OK"]:
-            models = result["Value"]
-            for model in models:
-                self.cpuDict[model] = {}
-                self.cpuDict[model]["TDP"] = gConfig.getValue(f"{self.section}/CPUData/{model}/TDP", DEFAULT_TDP)
-                self.cpuDict[model]["Cores"] = gConfig.getValue(f"{self.section}/CPUData/{model}/Cores", 12)
+        res = gConfig.getSections(f"{self.section}/CPUData")
+        if res["OK"]:
+            for model in res["Value"]:
+                self.cpuDict[model] = {
+                    "TDP": gConfig.getValue(
+                        f"{self.section}/CPUData/{model}/TDP", DEFAULT_TDP
+                    ),
+                    "Cores": gConfig.getValue(
+                        f"{self.section}/CPUData/{model}/Cores", 12
+                    ),
+                }
 
-        print("AT >>> CPU data")
-        pprint.pprint(self.cpuDict)
-
+        self.log.info(f"Loaded {len(self.cpuDict)} CPU models")
         return S_OK()
 
+    # =====================================================================
+    # EXECUTE
+    # =====================================================================
     def execute(self):
-        """Report job green parameters"""
+        condDict = {
+            "Status": [JobStatus.DONE, JobStatus.FAILED],
+            "Site": SITES_EUROPE,
+            "ApplicationNumStatus": 0,
+        }
 
-        condDict = {"Status": [JobStatus.DONE, JobStatus.FAILED], "ApplicationNumStatus": 0}
-        result = self.jobDB.selectJobs(condDict, limit=self.maxJobsAtOnce, orderAttribute="LastUpdateTime:DESC" )
-        if not result["OK"]:
-            return result
+        res = self.jobDB.selectJobs(
+            condDict,
+            limit=self.maxJobsAtOnce,
+            orderAttribute="LastUpdateTime:DESC",
+        )
+        if not res["OK"]:
+            return res
 
-        jobList = result["Value"]
-        if not jobList:
-            self.log.info("No jobs to report")
+        jobIDs = [int(j) for j in res["Value"]]
+        if not jobIDs:
             return S_OK()
 
-        print("Job List", jobList)
+        # Load job parameters
+        if self.elasticJobParametersDB:
+            params = self.elasticJobParametersDB.getJobParameters(jobIDs)
+        else:
+            params = self.jobDB.getJobParameters(jobIDs)
 
-        result = self.elasticJobParametersDB.getJobParameters(jobList)
-        if not result["OK"]:
-            self.log.info("No parameters found")
-            return S_ERROR("No parameters found")
-        jobParamsDict = result["Value"]
+        attrs = self.jobDB.getJobsAttributes(jobIDs)
 
-        result = self.jobDB.getJobsAttributes(jobList)
-        if not result["OK"]:
-            self.log.info("No attributes found")
-            return S_ERROR("No attributes found")
-        jobAttrDict = result["Value"]
+        if not params["OK"] or not attrs["OK"]:
+            return S_ERROR("Failed to load job data")
 
+        jobParamsDict = params["Value"]
+        jobAttrDict = attrs["Value"]
 
-        #pprint.pprint(jo)
-        #pprint.pprint(jobAttrDict)
-        print("hello world")
-        # Form records
         records = []
-        for job in jobParamsDict:
-            jobDict = {}
-            for key in jobParamsDict[job]:
-                if key in JOB_PARAMETER_KEYS:
-                    jobDict[key] = jobParamsDict[job][key]
-            for key in jobAttrDict[job]:
-                if key in JOB_ATTRIBUTE_KEYS:
-                    if key in TIME_STAMPS:
-                       jobDict[key] = str(jobAttrDict[job][key])
-                    else:
-                       jobDict[key] = jobAttrDict[job][key]
 
-            records.append(jobDict)
+        for jobID in jobParamsDict:
+            rec = {}
 
-        # Mark jobs as reported
-        result = self.jobDB.setJobAttributes(jobList, ["ApplicationNumStatus"], [9999])
+            for k, v in jobParamsDict[jobID].items():
+                if k in JOB_PARAMETER_KEYS:
+                    rec[k] = v
+
+            for k, v in jobAttrDict.get(jobID, {}).items():
+                if k in JOB_ATTRIBUTE_KEYS:
+                    rec[k] = str(v) if k in TIME_STAMPS else v
+
+            rec["JobID"] = int(jobID)
+            records.append(rec)
+
+        successJobs = []
+
+        # -------------------------------------------------------------
+        # Process jobs
+        # -------------------------------------------------------------
+
+        startJobs = time.time()
+
+        for rec in records:
+
+            startRecord = time.time()
+
+            tdp, cores = self.__getProcessorParameters(
+                rec.get("ModelName", "Unknown")
+            )
+
+            site = rec.get("Site", "Unknown")
+
+            # ---- READ from CIM ----
+            pue, ci, gocdb = self.cimClient.getSiteGreenMetrics(
+                site,
+                startExecTime=rec.get("StartExecTime"),
+                endExecTime=rec.get("EndExecTime"),
+            )
+
+            self.log.debug(f"Time after getSiteGreenMetrics: {time.time()-startRecord}")
+
+            rec["SiteDIRAC"] = site
+            rec["SiteGOCDB"] = gocdb
+            rec["Site"] = gocdb
+
+            cpu_s = float(rec.get("TotalCPUTime(s)", 0))
+            wallclock_s = float(rec.get("WallClockTime(s)", 0))
+
+            # Default assumption: one core per process
+            cores_used = 1
+
+            energy_kwh = self.__compute_energy_kwh(
+                cpu_seconds=cpu_s,
+                wallclock_seconds=wallclock_s,
+                tdp=tdp,
+                total_cores=cores,
+                cores_used=cores_used,
+            )
+            energy_wh = energy_kwh * 1000.0
+            emissions = energy_kwh * pue * ci
+
+            cpunorm = float(rec.get("CPUNormalizationFactor", 0))
+            cee = (cpunorm * cores) / float(tdp) if tdp else 0.0
+
+            # -------------------------------------------------
+            # HTC metrics (added – minimal checks only)
+            # -------------------------------------------------
+            wallclock_s = float(rec.get("WallClockTime(s)", 0))
+            norm_cpu_s = float(rec.get("NormCPUTime(s)", 0))
+
+            if wallclock_s > 0:
+                rec["Efficiency"] = norm_cpu_s / wallclock_s
+            else:
+                rec["Efficiency"] = 0.0
+
+            if energy_wh > 0:
+                rec["Work"] = norm_cpu_s / energy_wh
+            else:
+                rec["Work"] = 0.0
+
+            rec.update({
+                "ExecUnitID": rec["JobID"],
+                "PUE": pue,
+                "CI_g": ci,
+                "Energy_wh": energy_wh,
+                "CFP_g": emissions,
+                "Owner": Registry.getVOForGroup(rec.get("OwnerGroup")),
+                "ExecUnitFinished": 1,
+                "NCores": cores,
+                "TDP_w": tdp,
+                "CEE": cee,
+            })
+
+            # -------------------------------------------------
+            # SUBMIT to CIM
+            # -------------------------------------------------
+
+            startCIM = time.time()
+
+            try:
+                self.log.info(f"Submitting full record to CIM: {rec}")
+                ok = self.cimClient.submitRecord(rec)
+                if ok:
+                    self.log.info(
+                        f"CIM submission OK for JobID={rec['ExecUnitID']} "
+                        f"Site={gocdb}; time spent {time.time() - startCIM}"
+                    )
+                    successJobs.append(rec["JobID"])
+                else:
+                    self.log.error(
+                        f"CIM submission FAILED for JobID={rec['ExecUnitID']}"
+                    )
+            except Exception as e:
+                self.log.exception(
+                    f"CIM submission EXCEPTION for JobID={rec['ExecUnitID']}: {e}"
+                )
+
+            # -------------------------------------------------
+            # STORE in ElasticSearch
+            # -------------------------------------------------
+            if self.__storeJobGreenMetrics(rec):
+                self.log.info(
+                    f"ElasticSearch storage OK for JobID={rec['ExecUnitID']}"
+                )
+
+        # Mark processed
+        self.log.info(f"Sending ApplicationNumStatus updates for {len(successJobs)} jobs")
+        result = self.jobDB.setJobAttributes(
+            successJobs, ["ApplicationNumStatus"], [9999]
+        )
         if not result["OK"]:
-            self.log.error(f"Failed to set ApplicationNumStatus for job {job}", result["Message"])
+             self.log.error("Failed to update ApplicationNumStatus attributes")
 
-        #for record in records:
-        #    pprint.pprint(record)
+        self.log.debug(f"Processing {len(records)} jobs in {time.time()-startJobs}")
 
-        # Get the processor TDP
-        for record in records:
-            result = self.__getProcessorParameters(record.get("ModelName", "Unknown"))
-            if not result["OK"]:
-                self.log.error("Failed to get processor parameters")
-                continue
-            tdp, n_cores = result["Value"]
-            site = record.get("Site", "Unknown")
-            result = self.__getSiteParameters(record["Site"])
-            if not result["OK"]:
-                self.log.error("Failed to get site parameters")
-                continue
-            pue, ci, gocdb_name = result["Value"]
-            cpu = record.get("TotalCPUTime(s)", 0)
-            cpu = float(cpu)
-            record["Energy(kwh)"] = cpu*tdp/n_cores/1000./3600.
-            record["TDP"] = tdp
-            record["NCores"] = n_cores
-            record["VO"] = Registry.getVOForGroup(record["OwnerGroup"])
-            record["SiteName"] = gocdb_name
+        return result
 
-        for record in records:
-            pprint.pprint(record)
-            result = self.__sendRecordToMB(record)
-
-        # Send records to the Metrics DB
-
-        return S_OK()
-
-    def __sendRecordToMB(self, record):
-
-        headers = { "Authorization": f"Bearer {METRICS_DB_TOKEN}",
-                    "Content-Type": "application/json"
-                  }
-
-        response = requests.post(METRICS_DB_URL,
-                                 headers = headers,
-                                 json = record
-                                )
-        print(response.status_code)
-        print(response.text)
-
-        return S_OK()
-
-    def __getSiteParameters(self, site):
-        """ To be implemented """
-
-        grid = site.split(".")[0]
-        gocdb_name = gConfig.getValue(f"/Resources/Sites/{grid}/{site}/Name", site)
-        pue = gConfig.getValue(f"/Resources/Sites/{grid}/{site}/GreenParams/PUE", DEFAULT_PUE)
-        ci = gConfig.getValue(f"/Resources/Sites/{grid}/{site}/GreenParams/CI", DEFAULT_CI)
-        return S_OK((pue, ci, gocdb_name))
-
+    # =====================================================================
+    # HELPERS
+    # =====================================================================
     def __getProcessorParameters(self, model):
-        """ Get TDP and number of cores """
-
         if model in self.cpuDict:
-            return S_OK((self.cpuDict[model]["TDP"], self.cpuDict[model]["Cores"]))
+            cpu = self.cpuDict[model]
+            return cpu["TDP"], cpu["Cores"]
+        self.log.warn(f"Unknown CPU model: {model}")
+        return DEFAULT_TDP, 12
 
-        print(f"AT >>> oooooooooooooo CPU Model {model} is not in the configuration ooooooooooooooo")
-        return S_OK((200, 12))
+    def __compute_energy_kwh(self, cpu_seconds, wallclock_seconds, tdp, total_cores, cores_used=1):
+        """
+        Energy model (professor's formula):
+
+        E = ((1-f)*CPUtime + f*WallClockTime)
+            * (CoresUsed / TotalCores)
+            * TDP
+
+        Returned value is in kWh.
+        """
+        try:
+            if wallclock_seconds <= 0 or total_cores <= 0:
+                return 0.0
+
+            f = IDLE_CONSUMPTION_FACTOR
+            f = max(0.0, min(1.0, f))
+
+            effective_time_s = (1.0 - f) * float(cpu_seconds) + f * float(wallclock_seconds)
+            core_fraction = float(cores_used) / float(total_cores)
+
+            energy_joule = effective_time_s * core_fraction * float(tdp)
+            energy_kwh = energy_joule / 3_600_000.0
+
+            return energy_kwh
+
+        except Exception:
+            return 0.0
+
+    def __storeJobGreenMetrics(self, record):
+        jobID = record.get("ExecUnitID")
+        if not jobID or not self.elasticJobParametersDB:
+            return False
+
+        es_params = {
+            k: (str(v) if k in TIME_STAMPS else v)
+            for k, v in record.items()
+            if v is not None
+        }
+
+        res = self.elasticJobParametersDB.setJobParameters(jobID, es_params)
+        if not res["OK"]:
+            self.log.error(
+                f"ElasticSearch write failed for JobID={jobID}: "
+                f"{res.get('Message')}"
+            )
+            return False
+
+        return True
