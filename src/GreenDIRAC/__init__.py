@@ -22,11 +22,12 @@ except PackageNotFoundError:
 
 def extension_metadata():
     return {
-        "primary_extension": True,
+        "primary_extension": False,
         "priority": 100,
         "setups": {
-            "Dirac-Production": "dips://ccdirac01.in2p3.fr:9135/Configuration/Server",
+            "DIRAC-Production": "dips://ccdiracli01.in2p3.fr:9135/Configuration/Server",
             "DIRAC-Test": "dips://cctbdirac01.in2p3.fr:9135/Configuration/Server",
+            "DIRAC-IN2P3": "dips://ccdiracsrv01.in2p3.fr:9135/Configuration/Server"
         },
-        "default_setup": "Dirac-Production",
+        "default_setup": "DIRAC-Production",
     }
