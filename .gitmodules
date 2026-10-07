@@ -1,0 +1,4 @@
+[submodule "research/DIRACGreenScoreTraceSimulator"]
+	path = research/DIRACGreenScoreTraceSimulator
+	url = https://github.com/mezzeddinee/DIRACGreenScoreTraceSimulator.git
+	branch = main

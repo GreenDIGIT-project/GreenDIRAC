@@ -31,6 +31,8 @@ DEFAULT_CEE = 1.0
 
 ES_TIME_WINDOW = "now-30d"
 
+DEFAULT_GREEN_METRICS_INDEX_BASE = "dirac-egi-_greenmetrics_index"
+
 
 # =====================================================================
 # GREEN SITE DIRECTOR
@@ -46,6 +48,7 @@ class SiteDirector(BaseSiteDirector):
         self._ceeCache = {}
         self._ceeCacheTimestamp = 0
         self.elasticJobParametersDB = None
+        self.greenMetricsIndexBase = DEFAULT_GREEN_METRICS_INDEX_BASE
 
     def _getElasticJobParametersDB(self):
         if self.elasticJobParametersDB:
@@ -217,7 +220,13 @@ class SiteDirector(BaseSiteDirector):
         if not db:
             return self._ceeCache
 
-        indexPattern = f"{db.indexName_base}_*"
+        # Use the same option and default as GreenReportingAgent so this reader
+        # follows the rolling indexes written by that agent.
+        self.greenMetricsIndexBase = self.am_getOption(
+            "GreenMetricsIndexBase", self.greenMetricsIndexBase
+        ).lower()
+        indexPattern = f"{self.greenMetricsIndexBase}_*"
+
         self.log.info(
             "GreenSiteDirector: querying ES via ElasticJobParametersDB "
             f"(host={getattr(db, '_dbHost', 'n/a')}, port={getattr(db, '_dbPort', 'n/a')}, "
@@ -353,3 +362,23 @@ class SiteDirector(BaseSiteDirector):
         )
 
         return avgCEE
+
+
+
+
+
+    def _getPilotOptions(self, queue, **kwargs):
+        """Override pilot options and force pilot MaxCycles to 50."""
+        pilotOptions = super()._getPilotOptions(queue, **kwargs)
+        if not pilotOptions:
+            pilotOptions = []
+
+        # Remove any pre-existing MaxCycles option to avoid conflicting values.
+        filteredOptions = [
+            opt
+            for opt in pilotOptions
+            if "MaxCycles" not in opt and "--maxCycles" not in opt and "--maxcycles" not in opt
+        ]
+        filteredOptions.append("--MaxCycles 50")
+        self.log.always(f"GreenSiteDirector: forcing pilot option --MaxCycles 50 for queue {queue}")
+        return filteredOptions

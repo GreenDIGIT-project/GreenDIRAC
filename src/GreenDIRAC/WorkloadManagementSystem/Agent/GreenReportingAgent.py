@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-GreenReportingAgent — Queries CIMClient for site green metrics,
-submits per-job green metrics to CIM,
-and stores them in DIRAC JobDB / ElasticSearch.
+GreenReportingAgent — Reads job parameters from ElasticJobParametersDB,
+computes and submits green metrics, and stores final records in dedicated
+rolling Elasticsearch indexes.
 """
 
 from datetime import timezone
+import re
 import time
 
 from DIRAC import S_OK, S_ERROR, gConfig
@@ -14,6 +15,7 @@ from DIRAC.WorkloadManagementSystem.Client import JobStatus
 from DIRAC.WorkloadManagementSystem.DB.JobDB import JobDB
 from DIRAC.ConfigurationSystem.Client.Helpers.Operations import Operations
 from DIRAC.Core.Utilities.ObjectLoader import ObjectLoader
+from DIRAC.Core.Utilities import TimeUtilities
 from DIRAC.ConfigurationSystem.Client.Helpers import Registry
 from DIRAC.ConfigurationSystem.Client import PathFinder
 
@@ -25,13 +27,14 @@ from GreenDIRAC.WorkloadManagementSystem.Client.CIMClient import CIMClient
 JOB_PARAMETER_KEYS = [
     "ModelName", "CPUNormalizationFactor", "HostName", "JobID", "JobType",
     "LoadAverage", "MemoryUsed(kb)", "NormCPUTime(s)", "ScaledCPUTime(s)",
-    "Status", "TotalCPUTime(s)", "WallClockTime(s)", "DiskSpace(MB)",
+     "TotalCPUTime(s)", "WallClockTime(s)", "DiskSpace(MB)",
     "CEQueue", "GridCE",
 ]
 
 JOB_ATTRIBUTE_KEYS = [
     "JobGroup", "JobName", "Owner", "OwnerDN", "OwnerGroup",
     "RescheduleCounter", "Site",
+    "Status",
     "SubmissionTime", "StartExecTime", "EndExecTime",
     "SystemPriority", "UserPriority",
 ]
@@ -98,6 +101,7 @@ SITES_EUROPE = [
     "EGI.UKIMBH.uk",
     "EGI.UKIR.uk",
     "EGI.UKIRALPP.uk",
+    "EGI.RAL.uk",
     "EGI.UKISHEF.uk",
     "EGI.ULAKBIM.tr",
     "EGI.ULB.be",
@@ -109,6 +113,157 @@ TIME_STAMPS = ["SubmissionTime", "StartExecTime", "EndExecTime"]
 DEFAULT_TDP = 150
 
 IDLE_CONSUMPTION_FACTOR = 0.4
+
+GREEN_METRICS_MAPPING = {
+    "properties": {
+        "AgentLocalSE": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "BatchSystem": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "CEE": {"type": "float"},
+        "CEQueue": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "CFP_g": {"type": "float"},
+        "CI_g": {"type": "float"},
+        "CPUNormalizationFactor": {"type": "long"},
+        "DiskSpace(MB)": {"type": "float"},
+        "Efficiency": {"type": "float"},
+        "EndExecTime": {
+            "type": "date",
+            "format": "yyyy-MM-dd HH:mm:ss||strict_date_optional_time",
+        },
+        "Energy_wh": {"type": "float"},
+        "Error Message": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "ErrorMessage": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "ExecUnitFinished": {"type": "long"},
+        "ExecUnitID": {"type": "long"},
+        "GridCE": {"type": "keyword"},
+        "HostName": {"type": "keyword"},
+        "JobGroup": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "JobID": {"type": "long"},
+        "JobName": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "JobType": {"type": "keyword"},
+        "JobWrapperPID": {"type": "long"},
+        "LastUpdateCPU(s)": {"type": "float"},
+        "LoadAverage": {"type": "float"},
+        "LocalAccount": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "LocalJobID": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "MatcherServiceTime": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "Memory(MB)": {"type": "long"},
+        "Memory(kB)": {"type": "long"},
+        "MemoryUsed(MB)": {"type": "float"},
+        "MemoryUsed(kb)": {"type": "long"},
+        "ModelName": {"type": "keyword"},
+        "NCores": {"type": "long"},
+        "NormCPUTime(s)": {"type": "long"},
+        "OutputData": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "OutputSandbox": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "OutputSandboxLFN": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "OutputSandboxMissingFiles": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "Owner": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "OwnerDN": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "OwnerGroup": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "PUE": {"type": "float"},
+        "PayloadPID": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "PendingRequest": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "PilotAgent": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "Pilot_Reference": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "RescheduleCounter": {"type": "long"},
+        "ScaledCPUTime(s)": {"type": "float"},
+        "Site": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "SiteDIRAC": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "SiteGOCDB": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "StandardOutput": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "StartExecTime": {
+            "type": "date",
+            "format": "yyyy-MM-dd HH:mm:ss||strict_date_optional_time",
+        },
+        "Status": {"type": "keyword"},
+        "SubmissionTime": {
+            "type": "date",
+            "format": "yyyy-MM-dd HH:mm:ss||strict_date_optional_time",
+        },
+        "SystemPriority": {"type": "long"},
+        "TDP_w": {"type": "long"},
+        "TotalCPUTime(s)": {"type": "long"},
+        "UserPriority": {"type": "long"},
+        "WallClockTime(s)": {"type": "float"},
+        "Work": {"type": "float"},
+        "timestamp": {"type": "date"},
+    }
+}
 
 
 # ==========================================================
@@ -122,6 +277,11 @@ class GreenReportingAgent(AgentModule):
         self.jobDB = None
         self.elasticJobParametersDB = None
         self.maxJobsAtOnce = 1000
+        self.greenMetricsIndexBase = "dirac-egi-_greenmetrics_index"
+        self.greenMetricsMaxDocuments = 1_000_000
+        self._activeGreenMetricsIndex = None
+        self._activeGreenMetricsCount = 0
+        self._ensuredGreenMetricsIndexes = set()
 
         self.section = PathFinder.getAgentSection(self.agentName)
 
@@ -153,6 +313,27 @@ class GreenReportingAgent(AgentModule):
         self.maxJobsAtOnce = self.am_getOption(
             "MaxJobsAtOnce", self.maxJobsAtOnce
         )
+
+        if not self.elasticJobParametersDB:
+            return S_ERROR(
+                "GreenReportingAgent requires ElasticJobParametersDB; "
+                "enable /Services/JobMonitoring/useESForJobParametersFlag"
+            )
+
+        self.greenMetricsIndexBase = self.am_getOption(
+            "GreenMetricsIndexBase", self.greenMetricsIndexBase
+        ).lower()
+        self.greenMetricsMaxDocuments = int(
+            self.am_getOption(
+                "GreenMetricsMaxDocuments", self.greenMetricsMaxDocuments
+            )
+        )
+        if self.greenMetricsMaxDocuments < 1:
+            return S_ERROR("GreenMetricsMaxDocuments must be greater than zero")
+
+        result = self.__initializeActiveGreenMetricsIndex()
+        if not result["OK"]:
+            return result
 
         # Instantiate CIM client
         self.cimClient = CIMClient(logger=self.log)
@@ -221,7 +402,10 @@ class GreenReportingAgent(AgentModule):
 
             for k, v in jobAttrDict.get(jobID, {}).items():
                 if k in JOB_ATTRIBUTE_KEYS:
-                    rec[k] = str(v) if k in TIME_STAMPS else v
+                    if k in TIME_STAMPS and (v is None or str(v) == "None"):
+                        rec.pop(k, None)
+                    else:
+                        rec[k] = str(v) if k in TIME_STAMPS else v
 
             rec["JobID"] = int(jobID)
             records.append(rec)
@@ -235,6 +419,16 @@ class GreenReportingAgent(AgentModule):
         startJobs = time.time()
 
         for rec in records:
+
+            if (
+                rec.get("Status") == JobStatus.FAILED
+                and rec.get("EndExecTime") is None
+            ):
+                self.log.info(
+                    f"Dropping failed JobID={rec['JobID']} without EndExecTime"
+                )
+                successJobs.append(rec["JobID"])
+                continue
 
             startRecord = time.time()
 
@@ -310,6 +504,7 @@ class GreenReportingAgent(AgentModule):
             # -------------------------------------------------
 
             startCIM = time.time()
+            cimStored = False
 
             try:
                 self.log.info(f"Submitting full record to CIM: {rec}")
@@ -319,7 +514,7 @@ class GreenReportingAgent(AgentModule):
                         f"CIM submission OK for JobID={rec['ExecUnitID']} "
                         f"Site={gocdb}; time spent {time.time() - startCIM}"
                     )
-                    successJobs.append(rec["JobID"])
+                    cimStored = True
                 else:
                     self.log.error(
                         f"CIM submission FAILED for JobID={rec['ExecUnitID']}"
@@ -332,13 +527,22 @@ class GreenReportingAgent(AgentModule):
             # -------------------------------------------------
             # STORE in ElasticSearch
             # -------------------------------------------------
-            if self.__storeJobGreenMetrics(rec):
+            greenMetricsStored = self.__storeJobGreenMetrics(rec)
+            if greenMetricsStored:
                 self.log.info(
                     f"ElasticSearch storage OK for JobID={rec['ExecUnitID']}"
                 )
 
+            # Mark a job processed only after both required destinations
+            # accepted the record. Otherwise the next cycle retries it.
+            if cimStored and greenMetricsStored:
+                successJobs.append(rec["JobID"])
+
         # Mark processed
         self.log.info(f"Sending ApplicationNumStatus updates for {len(successJobs)} jobs")
+        if not successJobs:
+            return S_OK()
+
         result = self.jobDB.setJobAttributes(
             successJobs, ["ApplicationNumStatus"], [9999]
         )
@@ -387,23 +591,182 @@ class GreenReportingAgent(AgentModule):
         except Exception:
             return 0.0
 
+    def __greenMetricsIndexName(self, sequence):
+        # Keep the same million-index suffix style used by DIRAC's
+        # ElasticJobParametersDB, for example "_233.0m".
+        return f"{self.greenMetricsIndexBase}_{float(sequence):.1f}m"
+
+    def __greenMetricsIndexSequence(self, indexName):
+        """
+        Extract the numeric rolling sequence from an index name.
+
+        Accepted examples:
+          dirac-in2p3-_greenmetrics_index_233m
+          dirac-in2p3-_greenmetrics_index_233.0m
+        """
+        match = re.match(
+            rf"^{re.escape(self.greenMetricsIndexBase)}_(\d+(?:\.\d+)?)m$",
+            indexName,
+        )
+        if not match:
+            return None
+        return int(float(match.group(1)))
+
+    def __getIndexDocumentCount(self, indexName):
+        query = {
+            "size": 0,
+            "track_total_hits": True,
+            "query": {"match_all": {}},
+        }
+        result = self.elasticJobParametersDB.query(index=indexName, query=query)
+        if not result["OK"]:
+            return result
+
+        total = result["Value"].get("hits", {}).get("total", 0)
+        if isinstance(total, dict):
+            total = total.get("value", 0)
+        return S_OK(int(total))
+
+    def __initializeActiveGreenMetricsIndex(self):
+        """
+        Single-agent startup logic: select and count only the highest-numbered
+        existing green-metrics index.
+        """
+        try:
+            indexNames = self.elasticJobParametersDB.getIndexes(
+                self.greenMetricsIndexBase
+            )
+        except Exception as exc:
+            return S_ERROR(f"Cannot list green metrics indexes: {exc}")
+
+        self.log.info(f"Discovered green metrics indexes: {indexNames}")
+        if not indexNames:
+            self._activeGreenMetricsIndex = self.__greenMetricsIndexName(0)
+            self._activeGreenMetricsCount = 0
+            self.log.info(
+                "No green metrics indexes exist; first record will create "
+                f"{self._activeGreenMetricsIndex}"
+            )
+            return S_OK(self._activeGreenMetricsIndex)
+
+        indexedSequences = []
+        for indexName in indexNames:
+            sequence = self.__greenMetricsIndexSequence(indexName)
+            if sequence is not None:
+                indexedSequences.append((sequence, indexName))
+
+        if not indexedSequences:
+            return S_ERROR(
+                f"No valid rolling indexes found for {self.greenMetricsIndexBase}; "
+                f"discovered={indexNames}"
+            )
+
+        sequence, indexName = max(indexedSequences)
+        self._ensuredGreenMetricsIndexes.add(indexName)
+
+        count = self.__getIndexDocumentCount(indexName)
+        if not count["OK"]:
+            return count
+
+        if count["Value"] >= self.greenMetricsMaxDocuments:
+            self._activeGreenMetricsIndex = self.__greenMetricsIndexName(
+                sequence + 1
+            )
+            self._activeGreenMetricsCount = 0
+        else:
+            self._activeGreenMetricsIndex = indexName
+            self._activeGreenMetricsCount = count["Value"]
+
+        self.log.info(
+            "Selected active green metrics index "
+            f"{self._activeGreenMetricsIndex} "
+            f"(documents={self._activeGreenMetricsCount})"
+        )
+        return S_OK(self._activeGreenMetricsIndex)
+
+    def __getWritableGreenMetricsIndex(self):
+        if not self._activeGreenMetricsIndex:
+            result = self.__initializeActiveGreenMetricsIndex()
+            if not result["OK"]:
+                return result
+
+        if self._activeGreenMetricsCount >= self.greenMetricsMaxDocuments:
+            sequence = self.__greenMetricsIndexSequence(
+                self._activeGreenMetricsIndex
+            )
+            if sequence is None:
+                return S_ERROR(
+                    f"Invalid green metrics index name: "
+                    f"{self._activeGreenMetricsIndex}"
+                )
+            self._activeGreenMetricsIndex = self.__greenMetricsIndexName(
+                sequence + 1
+            )
+            self._activeGreenMetricsCount = 0
+
+        return S_OK(self._activeGreenMetricsIndex)
+
+    def __createGreenMetricsIndex(self, indexName):
+        if indexName in self._ensuredGreenMetricsIndexes:
+            return S_OK(indexName)
+
+        result = self.elasticJobParametersDB.createIndex(
+            indexName,
+            GREEN_METRICS_MAPPING,
+            period=None,
+        )
+        if result["OK"]:
+            self._ensuredGreenMetricsIndexes.add(indexName)
+            self.log.info(f"Using green metrics index {indexName}")
+        return result
+
     def __storeJobGreenMetrics(self, record):
         jobID = record.get("ExecUnitID")
         if not jobID or not self.elasticJobParametersDB:
             return False
 
-        es_params = {
-            k: (str(v) if k in TIME_STAMPS else v)
-            for k, v in record.items()
-            if v is not None
-        }
-
-        res = self.elasticJobParametersDB.setJobParameters(jobID, es_params)
-        if not res["OK"]:
+        indexResult = self.__getWritableGreenMetricsIndex()
+        if not indexResult["OK"]:
             self.log.error(
-                f"ElasticSearch write failed for JobID={jobID}: "
-                f"{res.get('Message')}"
+                "Cannot select green metrics index: "
+                f"{indexResult.get('Message')}"
             )
             return False
+        indexName = indexResult["Value"]
+
+        createResult = self.__createGreenMetricsIndex(indexName)
+        if not createResult["OK"]:
+            self.log.error(
+                f"Cannot create green metrics index {indexName}: "
+                f"{createResult.get('Message')}"
+            )
+            return False
+
+        document = {
+            key: (str(value) if key in TIME_STAMPS else value)
+            for key, value in record.items()
+            if value is not None
+            and not (key in TIME_STAMPS and str(value) == "None")
+        }
+        document["timestamp"] = int(TimeUtilities.toEpochMilliSeconds())
+
+        documentExists = self.elasticJobParametersDB.existsDoc(
+            indexName,
+            docID=str(jobID),
+        )
+        result = self.elasticJobParametersDB.index(
+            indexName=indexName,
+            body=document,
+            docID=str(jobID),
+        )
+        if not result["OK"]:
+            self.log.error(
+                f"Green metrics write failed for JobID={jobID}, "
+                f"index={indexName}: {result.get('Message')}"
+            )
+            return False
+
+        if not documentExists:
+            self._activeGreenMetricsCount += 1
 
         return True
